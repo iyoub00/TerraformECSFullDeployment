@@ -47,7 +47,7 @@ ecs-infra-wema/
 # Create bucket
 aws s3api create-bucket \
   --bucket my-terraform-state-bucket \
-  --region us-east-1
+  --region eu-west-1
 
 # Enable versioning
 aws s3api put-bucket-versioning \
@@ -74,7 +74,7 @@ aws dynamodb create-table \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
-  --region us-east-1
+  --region eu-west-1
 ```
 
 ### 3. Update Terraform Backend Configuration
@@ -85,7 +85,7 @@ Edit `main.tf` and update the backend configuration:
 backend "s3" {
   bucket         = "YOUR-TERRAFORM-STATE-BUCKET"
   key            = "ecs-fargate/terraform.tfstate"
-  region         = "us-east-1"
+  region         = "eu-west-1"
   dynamodb_table = "terraform-state-lock"
   encrypt        = true
 }
@@ -100,7 +100,7 @@ cp terraform.tfvars.example terraform.tfvars
 Edit `terraform.tfvars` with your values:
 
 ```hcl
-aws_region   = "us-east-1"
+aws_region   = "eu-west-1"
 environment  = "dev"
 project_name = "my-app"
 
@@ -134,7 +134,7 @@ Edit `.github/workflows/deploy.yml` and update these values:
 
 ```yaml
 env:
-  AWS_REGION: us-east-1              # Your AWS region
+  AWS_REGION: eu-west-1              # Your AWS region
   ECR_REPOSITORY: my-app-app         # Format: {project_name}-app
   ECS_CLUSTER: my-app-cluster        # Format: {project_name}-cluster
   ECS_SERVICE: my-app-service        # Format: {project_name}-service
@@ -295,7 +295,7 @@ aws ecs describe-services \
 
 ```bash
 # Verify ECR authentication
-aws ecr get-login-password --region us-east-1
+aws ecr get-login-password --region eu-wesst-1
 
 # Check ECR repository
 aws ecr describe-repositories --repository-names my-app-app
