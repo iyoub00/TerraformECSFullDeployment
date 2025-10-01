@@ -210,23 +210,7 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
-resource "aws_security_group" "lambda" {
-  name        = "${var.project_name}-lambda-sg"
-  description = "Security group for Lambda functions"
-  vpc_id      = aws_vpc.main.id
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  tags = {
-    Name = "${var.project_name}-lambda-sg"
-  }
-}
 
 # ==========================================
 # Application Load Balancer
@@ -341,14 +325,7 @@ resource "aws_cloudwatch_log_group" "ecs" {
   }
 }
 
-resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.project_name}"
-  retention_in_days = var.log_retention_days
 
-  tags = {
-    Name = "${var.project_name}-lambda-logs"
-  }
-}
 
 # ==========================================
 # IAM Roles and Policies
@@ -422,37 +399,9 @@ resource "aws_iam_role" "ecs_task" {
   }
 }
 
-# Lambda Execution Role
-resource "aws_iam_role" "lambda" {
-  name = "${var.project_name}-lambda-role"
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
 
-  tags = {
-    Name = "${var.project_name}-lambda-role"
-  }
-}
 
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_vpc" {
-  role       = aws_iam_role.lambda.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
 
 # ==========================================
 # ECS Cluster
