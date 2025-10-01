@@ -78,7 +78,7 @@ Thumbs.db
 *.tmp
 *.temp
 
-# Secrets (just in case)
+# Secrets
 secrets.yml
 secrets.json
 credentials.json
