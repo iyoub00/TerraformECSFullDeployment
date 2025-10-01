@@ -12,7 +12,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "my-terraform-state-bucket"
+    bucket         = "my-terraform-state-ayoub-ecs-perso"
     key            = "ecs-fargate/terraform.tfstate"
     region         = "eu-west-1"
     dynamodb_table = "terraform-state-lock"

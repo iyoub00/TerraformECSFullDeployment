@@ -16,7 +16,7 @@ env:
   ECS_SERVICE: my-app-service
   ECS_TASK_DEFINITION: my-app-task
   CONTAINER_NAME: my-app-container
-  TERRAFORM_STATE_BUCKET: my-terraform-state-bucket
+  TERRAFORM_STATE_BUCKET: my-terraform-state-ayoub-ecs-perso
   TERRAFORM_LOCK_TABLE: terraform-state-lock
 
 jobs:
