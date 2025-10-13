@@ -9,7 +9,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
-COPY bedrock.py .         # <-- include your bedrock script in the image
+COPY bedrock.py .
+
 
 EXPOSE 5000
 CMD ["python", "app.py"]
