@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY bedrock.py .
 COPY s3.py .
+COPY sentiments-poc.py .
 
 
 EXPOSE 5000
