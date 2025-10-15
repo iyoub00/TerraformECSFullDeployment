@@ -179,6 +179,8 @@ jobs:
           echo "==== Terraform outputs ===="
           terraform output || true
           EOF
+          
+          
 
       - name: Access info
         run: |
