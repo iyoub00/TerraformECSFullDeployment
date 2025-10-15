@@ -1,0 +1,188 @@
+name: Provision EC2, SSH, run Terraform on EC2
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "hello-ecr/**"
+      - ".github/workflows/deploy-ec2.yml"
+  workflow_dispatch:
+
+jobs:
+  ec2-ssh-run:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: eu-west-1
+      EC2_INSTANCE_NAME: gha-terraform-runner
+      EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+      EC2_INSTANCE_TYPE: t3.micro
+      EC2_KEY_PAIR_NAME: ${{ secrets.EC2_KEY_PAIR_NAME }}  # must exist
+      SG_NAME: gha-ec2-sg
+      ASSOCIATE_EIP: "true"     # set to "false" if you don’t want a stable public IP
+      APP_PORT: "5000"          # change if your app listens elsewhere
+      REPO_TO_CLONE: "https://github.com/iyoub00/TerraformECSFullDeployment.git"
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get default VPC
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
+
+      - name: Get latest Ubuntu 22.04 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ec2 describe-images \
+            --owners 099720109477 \
+            --filters "Name=name,Values=${EC2_AMI_FILTER}" "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
+            --output text)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+
+      - name: Ensure Security Group (22, 80/443, and APP_PORT open)
+        id: sg
+        run: |
+          VPC_ID=${{ steps.vpc.outputs.VPC_ID }}
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters Name=group-name,Values=${SG_NAME} Name=vpc-id,Values=${VPC_ID} \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            SG_ID=$(aws ec2 create-security-group --group-name ${SG_NAME} --description "GHA EC2 SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+
+            # SSH (lock to your IP if you add YOUR_IP_CIDR secret)
+            if [ -n "${{ secrets.YOUR_IP_CIDR }}" ]; then
+              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr ${{ secrets.YOUR_IP_CIDR }}
+            else
+              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr 0.0.0.0/0
+            fi
+
+            # Web ports
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80   --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443  --cidr 0.0.0.0/0
+
+            # App port (e.g., Flask 5000). Change APP_PORT env if needed.
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port ${APP_PORT} --cidr 0.0.0.0/0
+          fi
+
+          echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Ensure Key Pair exists
+        run: |
+          set +e
+          aws ec2 describe-key-pairs --key-names "${EC2_KEY_PAIR_NAME}" >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "KeyPair ${EC2_KEY_PAIR_NAME} not found. Create it in eu-west-1 and put the private key PEM in EC2_SSH_PRIVATE_KEY secret."
+            exit 1
+          fi
+          set -e
+
+      - name: Launch or Reuse EC2
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
+
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ steps.ami.outputs.AMI_ID }} \
+              --instance-type ${EC2_INSTANCE_TYPE} \
+              --key-name ${EC2_KEY_PAIR_NAME} \
+              --security-group-ids ${{ steps.sg.outputs.SG_ID }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_INSTANCE_NAME}}]" \
+              --query 'Instances[0].InstanceId' --output text)
+          fi
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+          aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
+
+          if [ "${ASSOCIATE_EIP}" = "true" ]; then
+            ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+            aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID || true
+          fi
+
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_OUTPUT
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      - name: Wait for SSH
+        run: |
+          IP=${{ steps.ec2.outputs.PUBLIC_IP }}
+          for i in {1..30}; do
+            if nc -z $IP 22; then
+              echo "SSH open"
+              break
+            fi
+            echo "Waiting for SSH..."
+            sleep 10
+          done
+
+      - name: Add host to known_hosts
+        run: |
+          ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+
+      - name: Bootstrap EC2 (git/terraform/docker)
+        run: |
+          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y git unzip curl
+
+          if ! command -v terraform >/dev/null 2>&1; then
+            TF_VER="1.7.5"
+            curl -fsSLo /tmp/terraform.zip https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_linux_amd64.zip
+            sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
+          fi
+
+          if ! command -v docker >/dev/null 2>&1; then
+            curl -fsSL https://get.docker.com | sh
+            sudo usermod -aG docker ubuntu || true
+          fi
+          EOF
+
+      - name: Clone & run Terraform on EC2
+        run: |
+          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+          set -e
+          # Pull your infra repo
+          if [ ! -d TerraformECSFullDeployment ]; then
+            git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
+          fi
+          cd TerraformECSFullDeployment
+
+          # If this repo needs variables, write them here (example only):
+          # cat > terraform.tfvars <<VARS
+          # aws_region = "eu-west-1"
+          # VERS
+
+          terraform init -upgrade
+          terraform apply -auto-approve || { echo "terraform apply failed"; exit 1; }
+
+          echo "==== Terraform outputs ===="
+          terraform output || true
+          EOF
+
+      - name: Access info
+        run: |
+          echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
+          echo "If your app listens on ${APP_PORT}, try: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+          echo "If Terraform created an ALB, use its DNS from 'terraform output'."
+
