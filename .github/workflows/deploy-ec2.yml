@@ -23,7 +23,7 @@ jobs:
       EC2_INSTANCE_TYPE: t3.micro
       SG_NAME: gha-ec2-sg
       ASSOCIATE_EIP: "true"     # set to "false" if you don’t want a stable public IP
-      APP_PORT: "5000"          # change if your app listens elsewhere
+      APP_PORT: "5000"
       REPO_TO_CLONE: "https://github.com/iyoub00/TerraformECSFullDeployment.git"
 
     steps:
@@ -61,24 +61,19 @@ jobs:
           if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
             SG_ID=$(aws ec2 create-security-group --group-name ${SG_NAME} --description "GHA EC2 SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
 
-            # SSH (lock to your IP if you add YOUR_IP_CIDR secret)
             if [ -n "${{ secrets.YOUR_IP_CIDR }}" ]; then
               aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr ${{ secrets.YOUR_IP_CIDR }}
             else
               aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr 0.0.0.0/0
             fi
-
-            # Web ports
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80   --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443  --cidr 0.0.0.0/0
-
-            # App port (e.g., Flask 5000). Change APP_PORT env if needed.
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port ${APP_PORT} --cidr 0.0.0.0/0
           fi
 
           echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
 
-      # ---------- Ephemeral key pair flow ----------
+      # Ephemeral key pair flow
       - name: Generate ephemeral SSH key
         id: eph
         run: |
@@ -91,18 +86,28 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} \
             --public-key-material fileb:///tmp/gha_ephemeral_key.pub
-      # ---------------------------------------------
 
-      - name: Launch or Reuse EC2
+      - name: Launch or Reuse EC2 (replace if key mismatches)
         id: ec2
         env:
           KEY_NAME: ${{ steps.eph.outputs.EPH_KEY_NAME }}
         run: |
+          # Try to find an existing instance by Name tag
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
             --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
 
-          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+          if [ "$INSTANCE_ID" != "None" ] && [ -n "$INSTANCE_ID" ]; then
+            CUR_KEY=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].KeyName' --output text)
+            if [ "$CUR_KEY" != "${KEY_NAME}" ]; then
+              echo "Existing instance $INSTANCE_ID uses key '$CUR_KEY' (expected '${KEY_NAME}'). Replacing it..."
+              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
+              INSTANCE_ID=""
+            fi
+          fi
+
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id ${{ steps.ami.outputs.AMI_ID }} \
               --instance-type ${EC2_INSTANCE_TYPE} \
@@ -114,14 +119,18 @@ jobs:
 
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-          aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
           if [ "${ASSOCIATE_EIP}" = "true" ]; then
-            ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
-            aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID || true
+            # try to reuse an unattached EIP if any; otherwise allocate
+            ALLOC_ID=$(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text | awk '{print $1}')
+            if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
+              ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+            fi
+            aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" || true
           fi
 
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
       - name: Prepare SSH key
@@ -143,16 +152,13 @@ jobs:
 
       - name: Add host to known_hosts
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          touch ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
           ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
-
 
       - name: Bootstrap EC2 (git/terraform/docker)
         run: |
-          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+          ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
           set -e
           sudo apt-get update -y
           sudo apt-get install -y git unzip curl
@@ -171,19 +177,14 @@ jobs:
 
       - name: Clone & run Terraform on EC2
         run: |
-          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+          ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
           set -e
-          # Pull your infra repo
           if [ ! -d TerraformECSFullDeployment ]; then
             git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
           fi
           cd TerraformECSFullDeployment
 
-          # If this repo needs variables, write them here (example only):
-          # cat > terraform.tfvars <<VARS
-          # aws_region = "eu-west-1"
-          # VARS
-
+          # Optional: provide tfvars here if needed
           terraform init -upgrade
           terraform apply -auto-approve || { echo "terraform apply failed"; exit 1; }
 
@@ -195,9 +196,7 @@ jobs:
         run: |
           echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
           echo "If your app listens on ${APP_PORT}, try: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
-          echo "If Terraform created an ALB, use its DNS from 'terraform output'."
 
-      # Clean up the imported ephemeral key pair (keeps your account tidy)
       - name: Cleanup ephemeral key pair
         if: always()
         run: |
