@@ -3,7 +3,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def hello():
-    return "Hello from ECR-deployed container!\n"
+    return "Hello user from ECR-deployed container!\n"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
