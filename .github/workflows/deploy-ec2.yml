@@ -183,13 +183,6 @@ jobs:
             git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
           fi
           cd TerraformECSFullDeployment
-
-          # Optional: provide tfvars here if needed
-          terraform init -upgrade
-          terraform apply -auto-approve || { echo "terraform apply failed"; exit 1; }
-
-          echo "==== Terraform outputs ===="
-          terraform output || true
           EOF
 
       - name: Access info
