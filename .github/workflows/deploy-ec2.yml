@@ -142,8 +142,13 @@ jobs:
           done
 
       - name: Add host to known_hosts
-        run: |
-          ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+  run: |
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    touch ~/.ssh/known_hosts
+    chmod 600 ~/.ssh/known_hosts
+    ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+
 
       - name: Bootstrap EC2 (git/terraform/docker)
         run: |
