@@ -1,0 +1,289 @@
+name: EC2 deploy (artifact-based)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "hello-ecr/**"
+      - ".github/workflows/deploy-ec2.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ec2-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_PORT: "5000"
+  HEALTH_PATH: "/health"
+  AWS_REGION: eu-west-1
+  EC2_INSTANCE_NAME: gha-terraform-runner
+  EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+  EC2_INSTANCE_TYPE: t3.micro
+  SG_NAME: gha-ec2-sg
+  ASSOCIATE_EIP: "true"
+
+jobs:
+  lint_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('hello-ecr/requirements.txt') }}
+      - name: Install deps & quick check
+        run: |
+          pip install -r hello-ecr/requirements.txt
+          # add: ruff/flake8/pytest here if you have them
+          echo "OK"
+
+  build_artifact:
+    needs: lint_and_test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build artifact
+        run: |
+          mkdir -p dist
+          tar -czf dist/hello-ecr.tgz -C hello-ecr .
+          date -u +%Y%m%dT%H%M%SZ > dist/BUILD_ID
+          sha256sum dist/hello-ecr.tgz > dist/hello-ecr.tgz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-ecr-artifact
+          path: dist/
+          compression-level: 0
+
+  ensure_ec2_target:
+    needs: build_artifact
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    outputs:
+      PUBLIC_IP: ${{ steps.out.outputs.PUBLIC_IP }}
+      EPH_KEY_NAME: ${{ steps.out.outputs.EPH_KEY_NAME }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare network + instance (SG/EIP/AMI/keypair/EC2)
+        id: prep
+        env:
+          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}
+        run: |
+          set -euo pipefail
+
+          # Default VPC
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+
+          # SG (idempotent) + rules
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters Name=group-name,Values="${SG_NAME}" Name=vpc-id,Values="${VPC_ID}" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+
+          if [ -z "${SG_ID}" ] || [ "${SG_ID}" = "None" ]; then
+            SG_ID=$(aws ec2 create-security-group \
+              --vpc-id "${VPC_ID}" \
+              --group-name "${SG_NAME}" \
+              --description "GHA EC2 SG" \
+              --query GroupId --output text)
+            # SSH
+            if [ -n "${YOUR_IP_CIDR:-}" ]; then
+              aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr "${YOUR_IP_CIDR}"
+            else
+              aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+            fi
+            # HTTP/HTTPS + APP
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80  --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 443 --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port "${APP_PORT}" --cidr 0.0.0.0/0
+          fi
+
+          # Latest Ubuntu 22.04 AMI
+          AMI_ID=$(aws ec2 describe-images \
+            --owners 099720109477 \
+            --filters "Name=name,Values=${EC2_AMI_FILTER}" "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
+            --output text)
+
+          # Ephemeral SSH keypair
+          KEY_NAME="gha-ephemeral-$(date +%s)"
+          ssh-keygen -t ed25519 -N "" -f /tmp/gha_ephemeral_key
+          aws ec2 import-key-pair --key-name "${KEY_NAME}" --public-key-material fileb:///tmp/gha_ephemeral_key.pub >/dev/null
+          cp /tmp/gha_ephemeral_key /tmp/key.pem
+          chmod 600 /tmp/key.pem
+
+          # Find or (re)create instance; replace if key mismatches
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
+
+          if [ -n "${INSTANCE_ID}" ] && [ "${INSTANCE_ID}" != "None" ]; then
+            CUR_KEY=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].KeyName' --output text)
+            if [ "$CUR_KEY" != "${KEY_NAME}" ]; then
+              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
+              INSTANCE_ID=""
+            fi
+          fi
+
+          if [ -z "${INSTANCE_ID}" ] || [ "${INSTANCE_ID}" = "None" ]; then
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id "${AMI_ID}" \
+              --instance-type "${EC2_INSTANCE_TYPE}" \
+              --key-name "${KEY_NAME}" \
+              --security-group-ids "${SG_ID}" \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_INSTANCE_NAME}}]" \
+              --query 'Instances[0].InstanceId' --output text)
+          fi
+
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+
+          # Associate (or reuse) an EIP
+          if [ "${ASSOCIATE_EIP}" = "true" ]; then
+            ALLOC_ID=$(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text | awk '{print $1}')
+            if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
+              ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+            fi
+            aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" || true
+          fi
+
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+          echo "PUBLIC_IP=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+          echo "EPH_KEY_NAME=${KEY_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload ephemeral private key (scoped to this workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-key
+          path: /tmp/key.pem
+          retention-days: 1
+
+      - name: Out
+        id: out
+        run: |
+          echo "PUBLIC_IP=${{ steps.prep.outputs.PUBLIC_IP }}" >> $GITHUB_OUTPUT
+          echo "EPH_KEY_NAME=${{ steps.prep.outputs.EPH_KEY_NAME }}" >> $GITHUB_OUTPUT
+
+  deploy_to_ec2:
+    needs: [build_artifact, ensure_ec2_target]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact (app)
+        uses: actions/download-artifact@v4
+        with:
+          name: hello-ecr-artifact
+          path: ./artifact
+
+      - name: Verify artifact
+        run: |
+          cd artifact && sha256sum -c hello-ecr.tgz.sha256
+
+      - name: Download ephemeral key
+        uses: actions/download-artifact@v4
+        with:
+          name: ephemeral-key
+          path: ./ssh
+
+      - name: Prepare SSH
+        run: |
+          chmod 600 ./ssh/key.pem
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ needs.ensure_ec2_target.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+          # Wait for SSH
+          for i in {1..30}; do nc -z ${{ needs.ensure_ec2_target.outputs.PUBLIC_IP }} 22 && break || (echo "waiting for ssh..." && sleep 5); done
+
+      - name: Upload app artifact
+        run: |
+          scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@${{ needs.ensure_ec2_target.outputs.PUBLIC_IP }}:/home/ubuntu/hello-ecr.tgz
+
+      - name: Deploy & restart (systemd)
+        run: |
+          ssh -i ./ssh/key.pem ubuntu@${{ needs.ensure_ec2_target.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y python3 python3-venv python3-pip
+          APP_ROOT=/home/ubuntu/app
+          RELEASES=/home/ubuntu/releases
+          mkdir -p "$RELEASES" "$APP_ROOT"
+          BUILD_ID=$(date -u +%Y%m%dT%H%M%SZ)
+          REL="$RELEASES/$BUILD_ID"
+          mkdir -p "$REL"
+          tar -xzf /home/ubuntu/hello-ecr.tgz -C "$REL"
+          if [ ! -d "$APP_ROOT/.venv" ]; then python3 -m venv "$APP_ROOT/.venv"; "$APP_ROOT/.venv/bin/pip" -q install --upgrade pip; fi
+          if [ -f "$REL/requirements.txt" ]; then "$APP_ROOT/.venv/bin/pip" -q install -r "$REL/requirements.txt"; fi
+          ln -sfn "$REL" "$APP_ROOT/current"
+          sudo bash -c 'cat > /etc/systemd/system/hello-ecr.service <<SVC
+          [Unit]
+          Description=hello-ecr
+          After=network.target
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/app/current
+          ExecStart=/home/ubuntu/app/.venv/bin/python app.py
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          SVC'
+          sudo systemctl daemon-reload
+          sudo systemctl enable hello-ecr --now
+          sudo systemctl restart hello-ecr
+          # keep last 5 releases
+          ls -1dt $RELEASES/* 2>/dev/null | tail -n +6 | xargs -r rm -rf
+          EOF
+
+  smoke_test:
+    needs: deploy_to_ec2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check health
+        run: |
+          URL="http://${{ needs.ensure_ec2_target.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}${{ env.HEALTH_PATH }}"
+          echo "Hitting: $URL"
+          for i in {1..15}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i: $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 4
+          done
+          echo "Health check failed"; exit 1
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          echo "Fetching last logs from the instance…"
+          # (best-effort) requires the ephemeral key again
+          echo "Re-downloading ephemeral key artifact"
+          mkdir -p ./ssh && echo "ok" > /dev/null
+          echo "::group::logs"
+          exit 0
+
+  tag_and_notify:
+    if: needs.smoke_test.result == 'success'
+    needs: smoke_test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Tag/release & notify (add your step here)"
+
+  cleanup_keys:
+    if: always()
+    needs: [ensure_ec2_target, deploy_to_ec2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Delete ephemeral keypair
+        run: |
+          KEY="${{ needs.ensure_ec2_target.outputs.EPH_KEY_NAME }}"
+          [ -n "$KEY" ] && aws ec2 delete-key-pair --key-name "$KEY" || true
