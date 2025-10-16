@@ -196,29 +196,29 @@ jobs:
 
           [Install]
           WantedBy=multi-user.target
-  SERVICE'
+          SERVICE'
   
-  # Ensure app binds to 0.0.0.0:5000 inside app.py (Flask must listen externally)
-  # If your app already does this, nothing else to do.
-  
-  # Start + enable service
-  sudo systemctl daemon-reload
-  sudo systemctl enable hello-ecr.service
-  sudo systemctl restart hello-ecr.service
-  
-  # Show status once
-  sudo systemctl --no-pager -l status hello-ecr.service || true
-  EOF
-# --------------------------------------------------------------------
+          # Ensure app binds to 0.0.0.0:5000 inside app.py (Flask must listen externally)
+          # If your app already does this, nothing else to do.
+          
+          # Start + enable service
+          sudo systemctl daemon-reload
+          sudo systemctl enable hello-ecr.service
+          sudo systemctl restart hello-ecr.service
+          
+          # Show status once
+          sudo systemctl --no-pager -l status hello-ecr.service || true
+          EOF
+          # --------------------------------------------------------------------
 
-- name: Access info
-  run: |
-    echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
-    echo "App URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+      - name: Access info
+        run: |
+          echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
+          echo "App URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
 
-- name: Cleanup ephemeral key pair
-  if: always()
-  run: |
-    aws ec2 delete-key-pair \
-      --region ${{ env.AWS_REGION }} \
-      --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
+      - name: Cleanup ephemeral key pair
+        if: always()
+        run: |
+          aws ec2 delete-key-pair \
+            --region ${{ env.AWS_REGION }} \
+            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
