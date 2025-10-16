@@ -1,4 +1,4 @@
-name: Provision EC2, SSH, run Terraform on EC2
+name: Provision EC2, SSH, run hello-ecr/app.py
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
       EC2_INSTANCE_TYPE: t3.micro
       SG_NAME: gha-ec2-sg
-      ASSOCIATE_EIP: "true"     # set to "false" if you don’t want a stable public IP
+      ASSOCIATE_EIP: "true"
       APP_PORT: "5000"
       REPO_TO_CLONE: "https://github.com/iyoub00/TerraformECSFullDeployment.git"
 
@@ -73,7 +73,7 @@ jobs:
 
           echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
 
-      # Ephemeral key pair flow
+      # Ephemeral key pair
       - name: Generate ephemeral SSH key
         id: eph
         run: |
@@ -92,7 +92,6 @@ jobs:
         env:
           KEY_NAME: ${{ steps.eph.outputs.EPH_KEY_NAME }}
         run: |
-          # Try to find an existing instance by Name tag
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
             --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
@@ -122,7 +121,6 @@ jobs:
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
           if [ "${ASSOCIATE_EIP}" = "true" ]; then
-            # try to reuse an unattached EIP if any; otherwise allocate
             ALLOC_ID=$(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text | awk '{print $1}')
             if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
               ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
@@ -156,43 +154,71 @@ jobs:
           touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
           ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
 
-      - name: Bootstrap EC2 (git/terraform/docker)
+      # --------- SETUP PYTHON + RUN hello-ecr/app.py AS A SERVICE ----------
+      - name: Setup Python and run app.py
         run: |
           ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
           set -e
+
+          # System packages + Python bits
           sudo apt-get update -y
-          sudo apt-get install -y git unzip curl
+          sudo apt-get install -y git python3 python3-venv python3-pip
 
-          if ! command -v terraform >/dev/null 2>&1; then
-            TF_VER="1.7.5"
-            curl -fsSLo /tmp/terraform.zip https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_linux_amd64.zip
-            sudo unzip -o /tmp/terraform.zip -d /usr/local/bin
-          fi
-
-          if ! command -v docker >/dev/null 2>&1; then
-            curl -fsSL https://get.docker.com | sh
-            sudo usermod -aG docker ubuntu || true
-          fi
-          EOF
-
-      - name: Clone & run Terraform on EC2
-        run: |
-          ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
-          set -e
-          if [ ! -d TerraformECSFullDeployment ]; then
+          # Clone or update repo
+          if [ ! -d ~/TerraformECSFullDeployment ]; then
             git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
+          else
+            cd ~/TerraformECSFullDeployment && git pull --ff-only
           fi
-          cd TerraformECSFullDeployment
-          EOF
 
-      - name: Access info
-        run: |
-          echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
-          echo "If your app listens on ${APP_PORT}, try: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+          cd ~/TerraformECSFullDeployment/hello-ecr
 
-      - name: Cleanup ephemeral key pair
-        if: always()
-        run: |
-          aws ec2 delete-key-pair \
-            --region ${{ env.AWS_REGION }} \
-            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
+          # Python venv + deps
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          deactivate
+
+          # Create a systemd service to run app.py on boot + restart
+          sudo bash -c 'cat > /etc/systemd/system/hello-ecr.service <<SERVICE
+          [Unit]
+          Description=hello-ecr Python app
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/TerraformECSFullDeployment/hello-ecr
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=/home/ubuntu/TerraformECSFullDeployment/hello-ecr/.venv/bin/python app.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+  SERVICE'
+  
+  # Ensure app binds to 0.0.0.0:5000 inside app.py (Flask must listen externally)
+  # If your app already does this, nothing else to do.
+  
+  # Start + enable service
+  sudo systemctl daemon-reload
+  sudo systemctl enable hello-ecr.service
+  sudo systemctl restart hello-ecr.service
+  
+  # Show status once
+  sudo systemctl --no-pager -l status hello-ecr.service || true
+  EOF
+# --------------------------------------------------------------------
+
+- name: Access info
+  run: |
+    echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
+    echo "App URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+
+- name: Cleanup ephemeral key pair
+  if: always()
+  run: |
+    aws ec2 delete-key-pair \
+      --region ${{ env.AWS_REGION }} \
+      --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
