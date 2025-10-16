@@ -21,7 +21,6 @@ jobs:
       EC2_INSTANCE_NAME: gha-terraform-runner
       EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
       EC2_INSTANCE_TYPE: t3.micro
-      EC2_KEY_PAIR_NAME: ${{ secrets.EC2_KEY_PAIR_NAME }}  # must exist
       SG_NAME: gha-ec2-sg
       ASSOCIATE_EIP: "true"     # set to "false" if you don’t want a stable public IP
       APP_PORT: "5000"          # change if your app listens elsewhere
@@ -79,18 +78,25 @@ jobs:
 
           echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
 
-      - name: Ensure Key Pair exists
+      # ---------- Ephemeral key pair flow ----------
+      - name: Generate ephemeral SSH key
+        id: eph
         run: |
-          set +e
-          aws ec2 describe-key-pairs --key-names "${EC2_KEY_PAIR_NAME}" >/dev/null 2>&1
-          if [ $? -ne 0 ]; then
-            echo "KeyPair ${EC2_KEY_PAIR_NAME} not found. Create it in eu-west-1 and put the private key PEM in EC2_SSH_PRIVATE_KEY secret."
-            exit 1
-          fi
-          set -e
+          ssh-keygen -t ed25519 -N "" -f /tmp/gha_ephemeral_key
+          echo "EPH_KEY_NAME=gha-ephemeral-$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Import EC2 key pair
+        run: |
+          aws ec2 import-key-pair \
+            --region ${{ env.AWS_REGION }} \
+            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} \
+            --public-key-material fileb:///tmp/gha_ephemeral_key.pub
+      # ---------------------------------------------
 
       - name: Launch or Reuse EC2
         id: ec2
+        env:
+          KEY_NAME: ${{ steps.eph.outputs.EPH_KEY_NAME }}
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
@@ -100,7 +106,7 @@ jobs:
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id ${{ steps.ami.outputs.AMI_ID }} \
               --instance-type ${EC2_INSTANCE_TYPE} \
-              --key-name ${EC2_KEY_PAIR_NAME} \
+              --key-name ${KEY_NAME} \
               --security-group-ids ${{ steps.sg.outputs.SG_ID }} \
               --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_INSTANCE_NAME}}]" \
               --query 'Instances[0].InstanceId' --output text)
@@ -120,7 +126,7 @@ jobs:
 
       - name: Prepare SSH key
         run: |
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > key.pem
+          cp /tmp/gha_ephemeral_key key.pem
           chmod 600 key.pem
 
       - name: Wait for SSH
@@ -171,7 +177,7 @@ jobs:
           # If this repo needs variables, write them here (example only):
           # cat > terraform.tfvars <<VARS
           # aws_region = "eu-west-1"
-          # VERS
+          # VARS
 
           terraform init -upgrade
           terraform apply -auto-approve || { echo "terraform apply failed"; exit 1; }
@@ -179,8 +185,6 @@ jobs:
           echo "==== Terraform outputs ===="
           terraform output || true
           EOF
-          
-          
 
       - name: Access info
         run: |
@@ -188,3 +192,10 @@ jobs:
           echo "If your app listens on ${APP_PORT}, try: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
           echo "If Terraform created an ALB, use its DNS from 'terraform output'."
 
+      # Clean up the imported ephemeral key pair (keeps your account tidy)
+      - name: Cleanup ephemeral key pair
+        if: always()
+        run: |
+          aws ec2 delete-key-pair \
+            --region ${{ env.AWS_REGION }} \
+            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
