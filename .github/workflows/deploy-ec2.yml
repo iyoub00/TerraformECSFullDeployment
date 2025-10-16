@@ -154,17 +154,14 @@ jobs:
           touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
           ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
 
-      # --------- SETUP PYTHON + RUN hello-ecr/app.py AS A SERVICE ----------
+      # --------- SETUP PYTHON APP (systemd) ----------
       - name: Setup Python and run app.py
         run: |
           ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
           set -e
-
-          # System packages + Python bits
           sudo apt-get update -y
           sudo apt-get install -y git python3 python3-venv python3-pip
 
-          # Clone or update repo
           if [ ! -d ~/TerraformECSFullDeployment ]; then
             git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
           else
@@ -172,20 +169,16 @@ jobs:
           fi
 
           cd ~/TerraformECSFullDeployment/hello-ecr
-
-          # Python venv + deps
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           deactivate
 
-          # Create a systemd service to run app.py on boot + restart
           sudo bash -c 'cat > /etc/systemd/system/hello-ecr.service <<SERVICE
           [Unit]
           Description=hello-ecr Python app
           After=network.target
-
           [Service]
           User=ubuntu
           WorkingDirectory=/home/ubuntu/TerraformECSFullDeployment/hello-ecr
@@ -193,28 +186,87 @@ jobs:
           ExecStart=/home/ubuntu/TerraformECSFullDeployment/hello-ecr/.venv/bin/python app.py
           Restart=always
           RestartSec=5
-
           [Install]
           WantedBy=multi-user.target
           SERVICE'
-  
-          # Ensure app binds to 0.0.0.0:5000 inside app.py (Flask must listen externally)
-          # If your app already does this, nothing else to do.
           
-          # Start + enable service
           sudo systemctl daemon-reload
           sudo systemctl enable hello-ecr.service
           sudo systemctl restart hello-ecr.service
-          
-          # Show status once
           sudo systemctl --no-pager -l status hello-ecr.service || true
           EOF
-          # --------------------------------------------------------------------
+
+      # --------- NGINX HTTPS (self-signed cert for the IP) ----------
+      - name: Install Nginx and enable HTTPS (self-signed)
+        run: |
+          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << EOF
+          set -e
+          IP="${{ steps.ec2.outputs.PUBLIC_IP }}"
+          
+          sudo apt-get update -y
+          sudo apt-get install -y nginx openssl
+          
+          # Create self-signed cert with IP in SubjectAltName
+          sudo mkdir -p /etc/ssl/private /etc/ssl/certs
+          cat > /tmp/openssl.cnf <<CONF
+          [ req ]
+          default_bits       = 2048
+          prompt             = no
+          default_md         = sha256
+          distinguished_name = dn
+          req_extensions     = req_ext
+          x509_extensions    = req_ext
+          [ dn ]
+          CN = $IP
+          [ req_ext ]
+          subjectAltName = @alt_names
+          [ alt_names ]
+          IP.1 = $IP
+          CONF
+          
+          sudo openssl req -x509 -nodes -days 365 \
+          -newkey rsa:2048 \
+          -keyout /etc/ssl/private/selfsigned.key \
+          -out /etc/ssl/certs/selfsigned.crt \
+          -config /tmp/openssl.cnf
+          
+          # Nginx reverse proxy with HTTP->HTTPS redirect
+          sudo bash -c "cat > /etc/nginx/sites-available/hello-ecr <<NGINX
+          server {
+          listen 80;
+          server_name _;
+          return 301 https://\$host\$request_uri;
+          }
+          server {
+          listen 443 ssl;
+          server_name _;
+          ssl_certificate     /etc/ssl/certs/selfsigned.crt;
+          ssl_certificate_key /etc/ssl/private/selfsigned.key;
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_ciphers HIGH:!aNULL:!MD5;
+          
+          location / {
+          proxy_pass http://127.0.0.1:5000;
+          proxy_set_header Host \$host;
+          proxy_set_header X-Real-IP \$remote_addr;
+          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto https;
+          proxy_read_timeout 300;
+          }
+          }
+          NGINX"
+          
+          sudo ln -sf /etc/nginx/sites-available/hello-ecr /etc/nginx/sites-enabled/hello-ecr
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
+          sudo systemctl reload nginx
+          EOF
 
       - name: Access info
         run: |
           echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
-          echo "App URL: http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+          echo "HTTP :  http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+          echo "HTTPS: https://${{ steps.ec2.outputs.PUBLIC_IP }}/  (self-signed cert: expect a browser warning)"
 
       - name: Cleanup ephemeral key pair
         if: always()
