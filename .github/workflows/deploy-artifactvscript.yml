@@ -1,0 +1,132 @@
+name: EC2 deploy (artifact-based, clean)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - hello-ecr/**
+      - .github/workflows/deploy-artifactvscript.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ec2-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_PORT: "5000"
+  HEALTH_PATH: "/"
+  AWS_REGION: eu-west-1
+  EC2_INSTANCE_NAME: gha-terraform-runner
+  EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+  EC2_INSTANCE_TYPE: t3.micro
+  SG_NAME: gha-ec2-sg
+  ASSOCIATE_EIP: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('hello-ecr/requirements.txt') }}
+      - name: Build artifact
+        run: |
+          mkdir -p dist
+          tar -czf dist/hello-ecr.tgz -C hello-ecr .
+          (cd dist && sha256sum hello-ecr.tgz > hello-ecr.tgz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-ecr-artifact
+          path: dist/
+          compression-level: 0
+
+  ensure_ec2:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    outputs:
+      PUBLIC_IP: ${{ steps.out.outputs.PUBLIC_IP }}
+      EPH_KEY_NAME: ${{ steps.out.outputs.EPH_KEY_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: gha-ec2-deploy
+      - name: Ensure EC2 (SG/EIP/AMI/key/instance)
+        id: ensure
+        env:
+          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}
+        run: bash hello-ecr/scripts/ensure_ec2.sh
+      - name: Save outputs
+        id: out
+        run: |
+          echo "PUBLIC_IP=${{ steps.ensure.outputs.PUBLIC_IP }}" >> $GITHUB_OUTPUT
+          echo "EPH_KEY_NAME=${{ steps.ensure.outputs.EPH_KEY_NAME }}" >> $GITHUB_OUTPUT
+      - name: Upload ephemeral key
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephemeral-key
+          path: /tmp/key.pem
+          retention-days: 1
+
+  deploy:
+    needs: [build, ensure_ec2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: hello-ecr-artifact, path: ./artifact }
+      - name: Verify artifact
+        run: cd artifact && sha256sum -c hello-ecr.tgz.sha256
+      - uses: actions/download-artifact@v4
+        with: { name: ephemeral-key, path: ./ssh }
+      - name: SSH bootstrap
+        run: |
+          chmod 600 ./ssh/key.pem
+          mkdir -p ~/.ssh && touch ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+      - name: Upload & deploy
+        env:
+          HOST: ${{ needs.ensure_ec2.outputs.PUBLIC_IP }}
+          PORT: ${{ env.APP_PORT }}
+        run: |
+          scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@$HOST:/home/ubuntu/hello-ecr.tgz
+          scp -i ./ssh/key.pem scripts/deploy_systemd.sh ubuntu@$HOST:/home/ubuntu/deploy_systemd.sh
+          ssh -i ./ssh/key.pem ubuntu@$HOST "bash /home/ubuntu/deploy_systemd.sh"
+  smoke:
+    needs: [deploy, ensure_ec2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check
+        env:
+          URL: http://${{ needs.ensure_ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}${{ env.HEALTH_PATH }}
+        run: |
+          echo "Hitting: $URL"
+          for i in {1..15}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i: $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 4
+          done
+          echo "Health check failed"; exit 1
+
+  cleanup:
+    if: always()
+    needs: [ensure_ec2, deploy]
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: gha-ec2-cleanup
+      - name: Delete ephemeral keypair
+        run: |
+          KEY="${{ needs.ensure_ec2.outputs.EPH_KEY_NAME }}"
+          [ -n "$KEY" ] && aws ec2 delete-key-pair --key-name "$KEY" || true
