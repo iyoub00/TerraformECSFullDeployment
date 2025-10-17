@@ -1,276 +1,276 @@
-name: Provision EC2, SSH, run hello-ecr/app.py
-
-on:
-  push:
-    branches: [ "main", "master" ]
-    paths:
-      - "hello-ecr/**"
-      - ".github/workflows/deploy-ec2.yml"
-  workflow_dispatch:
-
-jobs:
-  ec2-ssh-run:
-    runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
-    env:
-      AWS_REGION: eu-west-1
-      EC2_INSTANCE_NAME: gha-terraform-runner
-      EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
-      EC2_INSTANCE_TYPE: t3.micro
-      SG_NAME: gha-ec2-sg
-      ASSOCIATE_EIP: "true"
-      APP_PORT: "5000"
-      REPO_TO_CLONE: "https://github.com/iyoub00/TerraformECSFullDeployment.git"
-
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Get default VPC
-        id: vpc
-        run: |
-          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
-          echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
-
-      - name: Get latest Ubuntu 22.04 AMI
-        id: ami
-        run: |
-          AMI_ID=$(aws ec2 describe-images \
-            --owners 099720109477 \
-            --filters "Name=name,Values=${EC2_AMI_FILTER}" "Name=state,Values=available" \
-            --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
-            --output text)
-          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
-
-      - name: Ensure Security Group (22, 80/443, and APP_PORT open)
-        id: sg
-        run: |
-          VPC_ID=${{ steps.vpc.outputs.VPC_ID }}
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters Name=group-name,Values=${SG_NAME} Name=vpc-id,Values=${VPC_ID} \
-            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
-
-          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
-            SG_ID=$(aws ec2 create-security-group --group-name ${SG_NAME} --description "GHA EC2 SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
-
-            if [ -n "${{ secrets.YOUR_IP_CIDR }}" ]; then
-              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr ${{ secrets.YOUR_IP_CIDR }}
-            else
-              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr 0.0.0.0/0
-            fi
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80   --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443  --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port ${APP_PORT} --cidr 0.0.0.0/0
-          fi
-
-          echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
-
-      # Ephemeral key pair
-      - name: Generate ephemeral SSH key
-        id: eph
-        run: |
-          ssh-keygen -t ed25519 -N "" -f /tmp/gha_ephemeral_key
-          echo "EPH_KEY_NAME=gha-ephemeral-$(date +%s)" >> $GITHUB_OUTPUT
-
-      - name: Import EC2 key pair
-        run: |
-          aws ec2 import-key-pair \
-            --region ${{ env.AWS_REGION }} \
-            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} \
-            --public-key-material fileb:///tmp/gha_ephemeral_key.pub
-
-      - name: Launch or Reuse EC2 (replace if key mismatches)
-        id: ec2
-        env:
-          KEY_NAME: ${{ steps.eph.outputs.EPH_KEY_NAME }}
-        run: |
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
-            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
-
-          if [ "$INSTANCE_ID" != "None" ] && [ -n "$INSTANCE_ID" ]; then
-            CUR_KEY=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].KeyName' --output text)
-            if [ "$CUR_KEY" != "${KEY_NAME}" ]; then
-              echo "Existing instance $INSTANCE_ID uses key '$CUR_KEY' (expected '${KEY_NAME}'). Replacing it..."
-              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
-              aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
-              INSTANCE_ID=""
-            fi
-          fi
-
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            INSTANCE_ID=$(aws ec2 run-instances \
-              --image-id ${{ steps.ami.outputs.AMI_ID }} \
-              --instance-type ${EC2_INSTANCE_TYPE} \
-              --key-name ${KEY_NAME} \
-              --security-group-ids ${{ steps.sg.outputs.SG_ID }} \
-              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_INSTANCE_NAME}}]" \
-              --query 'Instances[0].InstanceId' --output text)
-          fi
-
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
-
-          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
-
-          if [ "${ASSOCIATE_EIP}" = "true" ]; then
-            ALLOC_ID=$(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text | awk '{print $1}')
-            if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
-              ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
-            fi
-            aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" || true
-          fi
-
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_OUTPUT
-
-      - name: Prepare SSH key
-        run: |
-          cp /tmp/gha_ephemeral_key key.pem
-          chmod 600 key.pem
-
-      - name: Wait for SSH
-        run: |
-          IP=${{ steps.ec2.outputs.PUBLIC_IP }}
-          for i in {1..30}; do
-            if nc -z $IP 22; then
-              echo "SSH open"
-              break
-            fi
-            echo "Waiting for SSH..."
-            sleep 10
-          done
-
-      - name: Add host to known_hosts
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
-          ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
-
-      # --------- SETUP PYTHON APP (systemd) ----------
-      - name: Setup Python and run app.py
-        run: |
-          ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
-          set -e
-          sudo apt-get update -y
-          sudo apt-get install -y git python3 python3-venv python3-pip
-
-          if [ ! -d ~/TerraformECSFullDeployment ]; then
-            git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
-          else
-            cd ~/TerraformECSFullDeployment && git pull --ff-only
-          fi
-
-          cd ~/TerraformECSFullDeployment/hello-ecr
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          deactivate
-
-          sudo bash -c 'cat > /etc/systemd/system/hello-ecr.service <<SERVICE
-          [Unit]
-          Description=hello-ecr Python app
-          After=network.target
-          [Service]
-          User=ubuntu
-          WorkingDirectory=/home/ubuntu/TerraformECSFullDeployment/hello-ecr
-          Environment=PYTHONUNBUFFERED=1
-          ExecStart=/home/ubuntu/TerraformECSFullDeployment/hello-ecr/.venv/bin/python app.py
-          Restart=always
-          RestartSec=5
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE'
-          
-          sudo systemctl daemon-reload
-          sudo systemctl enable hello-ecr.service
-          sudo systemctl restart hello-ecr.service
-          sudo systemctl --no-pager -l status hello-ecr.service || true
-          EOF
-
-      # --------- NGINX HTTPS (self-signed cert for the IP) ----------
-      - name: Install Nginx and enable HTTPS (self-signed)
-        run: |
-          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << EOF
-          set -e
-          IP="${{ steps.ec2.outputs.PUBLIC_IP }}"
-          
-          sudo apt-get update -y
-          sudo apt-get install -y nginx openssl
-          
-          # Create self-signed cert with IP in SubjectAltName
-          sudo mkdir -p /etc/ssl/private /etc/ssl/certs
-          cat > /tmp/openssl.cnf <<CONF
-          [ req ]
-          default_bits       = 2048
-          prompt             = no
-          default_md         = sha256
-          distinguished_name = dn
-          req_extensions     = req_ext
-          x509_extensions    = req_ext
-          [ dn ]
-          CN = $IP
-          [ req_ext ]
-          subjectAltName = @alt_names
-          [ alt_names ]
-          IP.1 = $IP
-          CONF
-          
-          sudo openssl req -x509 -nodes -days 365 \
-          -newkey rsa:2048 \
-          -keyout /etc/ssl/private/selfsigned.key \
-          -out /etc/ssl/certs/selfsigned.crt \
-          -config /tmp/openssl.cnf
-          
-          # Nginx reverse proxy with HTTP->HTTPS redirect
-          sudo bash -c "cat > /etc/nginx/sites-available/hello-ecr <<NGINX
-          server {
-          listen 80;
-          server_name _;
-          return 301 https://\$host\$request_uri;
-          }
-          server {
-          listen 443 ssl;
-          server_name _;
-          ssl_certificate     /etc/ssl/certs/selfsigned.crt;
-          ssl_certificate_key /etc/ssl/private/selfsigned.key;
-          ssl_protocols TLSv1.2 TLSv1.3;
-          ssl_ciphers HIGH:!aNULL:!MD5;
-          
-          location / {
-          proxy_pass http://127.0.0.1:5000;
-          proxy_set_header Host \$host;
-          proxy_set_header X-Real-IP \$remote_addr;
-          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-          proxy_set_header X-Forwarded-Proto https;
-          proxy_read_timeout 300;
-          }
-          }
-          NGINX"
-          
-          sudo ln -sf /etc/nginx/sites-available/hello-ecr /etc/nginx/sites-enabled/hello-ecr
-          sudo rm -f /etc/nginx/sites-enabled/default
-          sudo nginx -t
-          sudo systemctl reload nginx
-          EOF
-
-      - name: Access info
-        run: |
-          echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
-          echo "HTTP :  http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
-          echo "HTTPS: https://${{ steps.ec2.outputs.PUBLIC_IP }}/  (self-signed cert: expect a browser warning)"
-
-      - name: Cleanup ephemeral key pair
-        if: always()
-        run: |
-          aws ec2 delete-key-pair \
-            --region ${{ env.AWS_REGION }} \
-            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true
+#name: Provision EC2, SSH, run hello-ecr/app.py
+#
+#on:
+#  push:
+#    branches: [ "main", "master" ]
+#    paths:
+#      - "hello-ecr/**"
+#      - ".github/workflows/deploy-ec2.yml"
+#  workflow_dispatch:
+#
+#jobs:
+#  ec2-ssh-run:
+#    runs-on: ubuntu-latest
+#
+#    permissions:
+#      id-token: write
+#      contents: read
+#
+#    env:
+#      AWS_REGION: eu-west-1
+#      EC2_INSTANCE_NAME: gha-terraform-runner
+#      EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+#      EC2_INSTANCE_TYPE: t3.micro
+#      SG_NAME: gha-ec2-sg
+#      ASSOCIATE_EIP: "true"
+#      APP_PORT: "5000"
+#      REPO_TO_CLONE: "https://github.com/iyoub00/TerraformECSFullDeployment.git"
+#
+#    steps:
+#      - name: Configure AWS credentials
+#        uses: aws-actions/configure-aws-credentials@v4
+#        with:
+#          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#          aws-region: ${{ env.AWS_REGION }}
+#
+#      - name: Get default VPC
+#        id: vpc
+#        run: |
+#          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+#          echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
+#
+#      - name: Get latest Ubuntu 22.04 AMI
+#        id: ami
+#        run: |
+#          AMI_ID=$(aws ec2 describe-images \
+#            --owners 099720109477 \
+#            --filters "Name=name,Values=${EC2_AMI_FILTER}" "Name=state,Values=available" \
+#            --query 'Images | sort_by(@, &CreationDate)[-1].ImageId' \
+#            --output text)
+#          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+#
+#      - name: Ensure Security Group (22, 80/443, and APP_PORT open)
+#        id: sg
+#        run: |
+#          VPC_ID=${{ steps.vpc.outputs.VPC_ID }}
+#          SG_ID=$(aws ec2 describe-security-groups \
+#            --filters Name=group-name,Values=${SG_NAME} Name=vpc-id,Values=${VPC_ID} \
+#            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+#
+#          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+#            SG_ID=$(aws ec2 create-security-group --group-name ${SG_NAME} --description "GHA EC2 SG" --vpc-id $VPC_ID --query 'GroupId' --output text)
+#
+#            if [ -n "${{ secrets.YOUR_IP_CIDR }}" ]; then
+#              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr ${{ secrets.YOUR_IP_CIDR }}
+#            else
+#              aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22  --cidr 0.0.0.0/0
+#            fi
+#            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80   --cidr 0.0.0.0/0
+#            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443  --cidr 0.0.0.0/0
+#            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port ${APP_PORT} --cidr 0.0.0.0/0
+#          fi
+#
+#          echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+#
+#      # Ephemeral key pair
+#      - name: Generate ephemeral SSH key
+#        id: eph
+#        run: |
+#          ssh-keygen -t ed25519 -N "" -f /tmp/gha_ephemeral_key
+#          echo "EPH_KEY_NAME=gha-ephemeral-$(date +%s)" >> $GITHUB_OUTPUT
+#
+#      - name: Import EC2 key pair
+#        run: |
+#          aws ec2 import-key-pair \
+#            --region ${{ env.AWS_REGION }} \
+#            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} \
+#            --public-key-material fileb:///tmp/gha_ephemeral_key.pub
+#
+#      - name: Launch or Reuse EC2 (replace if key mismatches)
+#        id: ec2
+#        env:
+#          KEY_NAME: ${{ steps.eph.outputs.EPH_KEY_NAME }}
+#        run: |
+#          INSTANCE_ID=$(aws ec2 describe-instances \
+#            --filters "Name=tag:Name,Values=${EC2_INSTANCE_NAME}" "Name=instance-state-name,Values=running,pending" \
+#            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || true)
+#
+#          if [ "$INSTANCE_ID" != "None" ] && [ -n "$INSTANCE_ID" ]; then
+#            CUR_KEY=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].KeyName' --output text)
+#            if [ "$CUR_KEY" != "${KEY_NAME}" ]; then
+#              echo "Existing instance $INSTANCE_ID uses key '$CUR_KEY' (expected '${KEY_NAME}'). Replacing it..."
+#              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
+#              aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
+#              INSTANCE_ID=""
+#            fi
+#          fi
+#
+#          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+#            INSTANCE_ID=$(aws ec2 run-instances \
+#              --image-id ${{ steps.ami.outputs.AMI_ID }} \
+#              --instance-type ${EC2_INSTANCE_TYPE} \
+#              --key-name ${KEY_NAME} \
+#              --security-group-ids ${{ steps.sg.outputs.SG_ID }} \
+#              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${EC2_INSTANCE_NAME}}]" \
+#              --query 'Instances[0].InstanceId' --output text)
+#          fi
+#
+#          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+#
+#          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+#
+#          if [ "${ASSOCIATE_EIP}" = "true" ]; then
+#            ALLOC_ID=$(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text | awk '{print $1}')
+#            if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "None" ]; then
+#              ALLOC_ID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+#            fi
+#            aws ec2 associate-address --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" || true
+#          fi
+#
+#          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+#          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_OUTPUT
+#
+#      - name: Prepare SSH key
+#        run: |
+#          cp /tmp/gha_ephemeral_key key.pem
+#          chmod 600 key.pem
+#
+#      - name: Wait for SSH
+#        run: |
+#          IP=${{ steps.ec2.outputs.PUBLIC_IP }}
+#          for i in {1..30}; do
+#            if nc -z $IP 22; then
+#              echo "SSH open"
+#              break
+#            fi
+#            echo "Waiting for SSH..."
+#            sleep 10
+#          done
+#
+#      - name: Add host to known_hosts
+#        run: |
+#          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+#          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+#          ssh-keyscan -H ${{ steps.ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+#
+#      # --------- SETUP PYTHON APP (systemd) ----------
+#      - name: Setup Python and run app.py
+#        run: |
+#          ssh -i key.pem -o StrictHostKeyChecking=yes ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << "EOF"
+#          set -e
+#          sudo apt-get update -y
+#          sudo apt-get install -y git python3 python3-venv python3-pip
+#
+#          if [ ! -d ~/TerraformECSFullDeployment ]; then
+#            git clone https://github.com/iyoub00/TerraformECSFullDeployment.git
+#          else
+#            cd ~/TerraformECSFullDeployment && git pull --ff-only
+#          fi
+#
+#          cd ~/TerraformECSFullDeployment/hello-ecr
+#          python3 -m venv .venv
+#          source .venv/bin/activate
+#          pip install --upgrade pip
+#          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+#          deactivate
+#
+#          sudo bash -c 'cat > /etc/systemd/system/hello-ecr.service <<SERVICE
+#          [Unit]
+#          Description=hello-ecr Python app
+#          After=network.target
+#          [Service]
+#          User=ubuntu
+#          WorkingDirectory=/home/ubuntu/TerraformECSFullDeployment/hello-ecr
+#          Environment=PYTHONUNBUFFERED=1
+#          ExecStart=/home/ubuntu/TerraformECSFullDeployment/hello-ecr/.venv/bin/python app.py
+#          Restart=always
+#          RestartSec=5
+#          [Install]
+#          WantedBy=multi-user.target
+#          SERVICE'
+#
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable hello-ecr.service
+#          sudo systemctl restart hello-ecr.service
+#          sudo systemctl --no-pager -l status hello-ecr.service || true
+#          EOF
+#
+#      # --------- NGINX HTTPS (self-signed cert for the IP) ----------
+#      - name: Install Nginx and enable HTTPS (self-signed)
+#        run: |
+#          ssh -i key.pem ubuntu@${{ steps.ec2.outputs.PUBLIC_IP }} 'bash -s' << EOF
+#          set -e
+#          IP="${{ steps.ec2.outputs.PUBLIC_IP }}"
+#
+#          sudo apt-get update -y
+#          sudo apt-get install -y nginx openssl
+#
+#          # Create self-signed cert with IP in SubjectAltName
+#          sudo mkdir -p /etc/ssl/private /etc/ssl/certs
+#          cat > /tmp/openssl.cnf <<CONF
+#          [ req ]
+#          default_bits       = 2048
+#          prompt             = no
+#          default_md         = sha256
+#          distinguished_name = dn
+#          req_extensions     = req_ext
+#          x509_extensions    = req_ext
+#          [ dn ]
+#          CN = $IP
+#          [ req_ext ]
+#          subjectAltName = @alt_names
+#          [ alt_names ]
+#          IP.1 = $IP
+#          CONF
+#
+#          sudo openssl req -x509 -nodes -days 365 \
+#          -newkey rsa:2048 \
+#          -keyout /etc/ssl/private/selfsigned.key \
+#          -out /etc/ssl/certs/selfsigned.crt \
+#          -config /tmp/openssl.cnf
+#
+#          # Nginx reverse proxy with HTTP->HTTPS redirect
+#          sudo bash -c "cat > /etc/nginx/sites-available/hello-ecr <<NGINX
+#          server {
+#          listen 80;
+#          server_name _;
+#          return 301 https://\$host\$request_uri;
+#          }
+#          server {
+#          listen 443 ssl;
+#          server_name _;
+#          ssl_certificate     /etc/ssl/certs/selfsigned.crt;
+#          ssl_certificate_key /etc/ssl/private/selfsigned.key;
+#          ssl_protocols TLSv1.2 TLSv1.3;
+#          ssl_ciphers HIGH:!aNULL:!MD5;
+#
+#          location / {
+#          proxy_pass http://127.0.0.1:5000;
+#          proxy_set_header Host \$host;
+#          proxy_set_header X-Real-IP \$remote_addr;
+#          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+#          proxy_set_header X-Forwarded-Proto https;
+#          proxy_read_timeout 300;
+#          }
+#          }
+#          NGINX"
+#
+#          sudo ln -sf /etc/nginx/sites-available/hello-ecr /etc/nginx/sites-enabled/hello-ecr
+#          sudo rm -f /etc/nginx/sites-enabled/default
+#          sudo nginx -t
+#          sudo systemctl reload nginx
+#          EOF
+#
+#      - name: Access info
+#        run: |
+#          echo "EC2 Public IP: ${{ steps.ec2.outputs.PUBLIC_IP }}"
+#          echo "HTTP :  http://${{ steps.ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}/"
+#          echo "HTTPS: https://${{ steps.ec2.outputs.PUBLIC_IP }}/  (self-signed cert: expect a browser warning)"
+#
+#      - name: Cleanup ephemeral key pair
+#        if: always()
+#        run: |
+#          aws ec2 delete-key-pair \
+#            --region ${{ env.AWS_REGION }} \
+#            --key-name ${{ steps.eph.outputs.EPH_KEY_NAME }} || true

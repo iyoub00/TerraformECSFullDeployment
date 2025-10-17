@@ -1,6 +1,6 @@
 name: EC2 deploy (artifact-based)
 
-'on':
+on:
   push:
     branches:
       - main
