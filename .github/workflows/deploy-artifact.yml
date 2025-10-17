@@ -2,7 +2,7 @@ name: EC2 deploy (artifact-based)
 
 on:
   push:
-    branches: [main, master]
+    branches: [ "main", "master" ]
     paths:
       - "hello-ecr/**"
       - ".github/workflows/deploy-ec2.yml"
