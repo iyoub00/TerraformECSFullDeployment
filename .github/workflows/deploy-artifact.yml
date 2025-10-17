@@ -7,7 +7,7 @@ on:
       - master
     paths:
       - hello-ecr/**
-      - .github/workflows/deploy-ec2.yml
+      - .github/workflows/deploy-artifact.yml
   workflow_dispatch: {}
 
 
