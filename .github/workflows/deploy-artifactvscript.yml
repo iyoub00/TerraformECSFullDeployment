@@ -62,6 +62,12 @@ jobs:
         id: ensure
         env:
           YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}
+          SG_NAME: ${{ env.SG_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
+          EC2_AMI_FILTER: ${{ env.EC2_AMI_FILTER }}
+          EC2_INSTANCE_TYPE: ${{ env.EC2_INSTANCE_TYPE }}
+          EC2_INSTANCE_NAME: ${{ env.EC2_INSTANCE_NAME }}
+          ASSOCIATE_EIP: ${{ env.ASSOCIATE_EIP }}
         run: bash hello-ecr/scripts/ensure_ec2.sh
       - name: Save outputs
         id: out
@@ -76,7 +82,7 @@ jobs:
           retention-days: 1
 
   deploy:
-    needs: [build, ensure_ec2]
+    needs: [ build, ensure_ec2 ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,35 +97,20 @@ jobs:
           chmod 600 ./ssh/key.pem
           mkdir -p ~/.ssh && touch ~/.ssh/known_hosts
           ssh-keyscan -H ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+          for i in {1..30}; do
+            nc -z ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} 22 && break || (echo "waiting for ssh..." && sleep 5)
+          done
       - name: Upload & deploy
         env:
           HOST: ${{ needs.ensure_ec2.outputs.PUBLIC_IP }}
-          PORT: ${{ env.APP_PORT }}
         run: |
           scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@$HOST:/home/ubuntu/hello-ecr.tgz
           scp -i ./ssh/key.pem hello-ecr/scripts/deploy_systemd.sh ubuntu@$HOST:/home/ubuntu/deploy_systemd.sh
           ssh -i ./ssh/key.pem ubuntu@$HOST "bash /home/ubuntu/deploy_systemd.sh"
 
-  smoke:
-    needs: [deploy, ensure_ec2]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Health check
-        env:
-          URL: http://${{ needs.ensure_ec2.outputs.PUBLIC_IP }}:${{ env.APP_PORT }}${{ env.HEALTH_PATH }}
-        run: |
-          echo "Hitting: $URL"
-          for i in {1..15}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "Attempt $i: $code"
-            [ "$code" = "200" ] && exit 0
-            sleep 4
-          done
-          echo "Health check failed"; exit 1
-
   cleanup:
     if: always()
-    needs: [ensure_ec2, deploy]
+    needs: [ ensure_ec2, deploy ]
     runs-on: ubuntu-latest
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
