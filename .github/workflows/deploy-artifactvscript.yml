@@ -13,37 +13,45 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  APP_PORT: "5000"
-  HEALTH_PATH: "/"
-  AWS_REGION: eu-west-1
-  EC2_INSTANCE_NAME: gha-terraform-runner
+  APP_PORT: "5000" # Flask app port
+  HEALTH_PATH: "/" # Endpoint used in health checks
+  AWS_REGION: eu-west-1 # AWS region for EC2 resources
+  EC2_INSTANCE_NAME: gha-terraform-runner # EC2 instance tag/name
   EC2_AMI_FILTER: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
-  EC2_INSTANCE_TYPE: t3.micro
-  SG_NAME: gha-ec2-sg
-  ASSOCIATE_EIP: "true"
+  EC2_INSTANCE_TYPE: t3.micro # Instance type
+  SG_NAME: gha-ec2-sg # Security group name
+  ASSOCIATE_EIP: "true" # Whether to assign an Elastic IP
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Checkout the repo so we can access the source code
       - uses: actions/checkout@v4
+      # Set up Python environment (used if we later run tests)
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      # Cache pip dependencies for faster builds
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('hello-ecr/requirements.txt') }}
+      # Build and checksum the artifact (tar.gz + sha256)
       - name: Build artifact
         run: |
           mkdir -p dist
           tar -czf dist/hello-ecr.tgz -C hello-ecr .
           (cd dist && sha256sum hello-ecr.tgz > hello-ecr.tgz.sha256)
+      # Upload artifact so other jobs can download it
       - uses: actions/upload-artifact@v4
         with:
           name: hello-ecr-artifact
           path: dist/
           compression-level: 0
 
+
+  # Provisions (or reuses) an EC2 instance with SSH access.
+  # Creates a temporary SSH keypair for this run only.
   ensure_ec2:
     needs: build
     runs-on: ubuntu-latest
@@ -51,17 +59,20 @@ jobs:
       PUBLIC_IP: ${{ steps.out.outputs.PUBLIC_IP }}
       EPH_KEY_NAME: ${{ steps.out.outputs.EPH_KEY_NAME }}
     steps:
+      # Checkout repo (to access script files)
       - uses: actions/checkout@v4
+      # Configure AWS credentials using access keys stored in repo secrets
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # optional
           aws-region: ${{ env.AWS_REGION }}
+      # Run the provisioning script to set up security group, AMI, keypair, and instance
       - name: Ensure EC2 (SG/EIP/AMI/key/instance)
         id: ensure
         env:
-          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}
+          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }} #IP restriction for SSH
           SG_NAME: ${{ env.SG_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
           EC2_AMI_FILTER: ${{ env.EC2_AMI_FILTER }}
@@ -69,11 +80,13 @@ jobs:
           EC2_INSTANCE_NAME: ${{ env.EC2_INSTANCE_NAME }}
           ASSOCIATE_EIP: ${{ env.ASSOCIATE_EIP }}
         run: bash hello-ecr/scripts/ensure_ec2.sh
+      # Save outputs (EC2 IP + key name) for downstream jobs
       - name: Save outputs
         id: out
         run: |
           echo "PUBLIC_IP=${{ steps.ensure.outputs.PUBLIC_IP }}" >> $GITHUB_OUTPUT
           echo "EPH_KEY_NAME=${{ steps.ensure.outputs.EPH_KEY_NAME }}" >> $GITHUB_OUTPUT
+      # Upload the private key (used later in deploy step)
       - name: Upload ephemeral key
         uses: actions/upload-artifact@v4
         with:
@@ -81,17 +94,23 @@ jobs:
           path: /tmp/key.pem
           retention-days: 1
 
+  # JOB 3: DEPLOY
   deploy:
     needs: [ build, ensure_ec2 ]
     runs-on: ubuntu-latest
     steps:
+      # Checkout repo (to get deploy scripts)
       - uses: actions/checkout@v4
+      # Download the app artifact built in the previous job
       - uses: actions/download-artifact@v4
         with: { name: hello-ecr-artifact, path: ./artifact }
+      # Verify checksum for artifact integrity
       - name: Verify artifact
         run: cd artifact && sha256sum -c hello-ecr.tgz.sha256
+      # Download the ephemeral SSH key from ensure_ec2
       - uses: actions/download-artifact@v4
         with: { name: ephemeral-key, path: ./ssh }
+      # Prepare SSH and wait for the instance to be ready
       - name: SSH bootstrap
         run: |
           chmod 600 ./ssh/key.pem
@@ -100,6 +119,7 @@ jobs:
           for i in {1..30}; do
             nc -z ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} 22 && break || (echo "waiting for ssh..." && sleep 5)
           done
+      # Upload app files and run remote deployment script via SSH
       - name: Upload & deploy
         env:
           HOST: ${{ needs.ensure_ec2.outputs.PUBLIC_IP }}
