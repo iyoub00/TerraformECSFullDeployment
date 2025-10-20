@@ -66,7 +66,7 @@ jobs:
           AWS_REGION:   ${{ env.AWS_REGION }}
           STACK_NAME:   ${{ env.EC2_INSTANCE_NAME }}
           KEY_NAME:     ${{ secrets.EC2_KEY_PAIR_NAME }}  # existing key pair name
-          INSTANCE_TYPE:${{ env.EC2_INSTANCE_TYPE }}
+          INSTANCE_TYPE: ${{ env.EC2_INSTANCE_TYPE }}
           APP_PORT:     ${{ env.APP_PORT }}
           YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}       # optional x.x.x.x/32
         run: bash hello-ecr/scripts/run_cfn_min.sh
