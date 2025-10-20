@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - hello-ecr/**
-      - .github/workflows/deploy-artifactvscript.yml
+      - .github/workflows/deploy-cf.yml
   workflow_dispatch:
 
 concurrency:
