@@ -1,0 +1,121 @@
+name: EC2 deploy (minimal run.sh)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - hello-ecr/**
+      - .github/workflows/deploy-cf-runsh.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ec2-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-west-1
+  EC2_INSTANCE_NAME: ubuntu-talent-acquisition
+  EC2_INSTANCE_TYPE: t3.micro
+  APP_PORT: "5000"
+  HEALTH_PATH: "/"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build artifact (tar hello-ecr/)
+        run: |
+          mkdir -p dist
+          tar -czf dist/hello-ecr.tgz -C hello-ecr .
+          (cd dist && sha256sum hello-ecr.tgz > hello-ecr.tgz.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-ecr-artifact
+          path: dist/
+          compression-level: 0
+
+  ensure_ec2:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      PUBLIC_IP: ${{ steps.out.outputs.PUBLIC_IP }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure EC2 via CloudFormation
+        id: ensure
+        env:
+          AWS_REGION:   ${{ env.AWS_REGION }}
+          STACK_NAME:   ${{ env.EC2_INSTANCE_NAME }}
+          KEY_NAME:     ${{ secrets.EC2_KEY_PAIR_NAME }}  # name of your existing EC2 key pair
+          INSTANCE_TYPE: ${{ env.EC2_INSTANCE_TYPE }}
+          APP_PORT:     ${{ env.APP_PORT }}
+          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}       # optional (x.x.x.x/32). if unset, SG is open
+        run: bash hello-ecr/scripts/run_cfn_min.sh
+
+      - name: Save outputs
+        id: out
+        run: echo "PUBLIC_IP=${{ steps.ensure.outputs.PUBLIC_IP }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: [build, ensure_ec2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hello-ecr-artifact
+          path: ./artifact
+
+      - name: Verify artifact
+        run: cd artifact && sha256sum -c hello-ecr.tgz.sha256
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ./ssh
+          echo "${{ secrets.EC2_PRIVATE_KEY_PEM }}" > ./ssh/key.pem
+          chmod 600 ./ssh/key.pem
+
+      - name: SSH bootstrap
+        run: |
+          mkdir -p ~/.ssh && touch ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
+          for i in {1..30}; do
+            nc -z ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} 22 && break || (echo "waiting for ssh..." && sleep 5)
+          done
+
+      - name: Upload & run (Ubuntu + run.sh)
+        env:
+          HOST: ${{ needs.ensure_ec2.outputs.PUBLIC_IP }}
+          APP_PORT: ${{ env.APP_PORT }}
+        run: |
+          # Upload artifact
+          scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@$HOST:/home/ubuntu/hello-ecr.tgz
+      
+          # Prepare instance and run run.sh in background
+          ssh -i ./ssh/key.pem ubuntu@$HOST "bash -lc '
+            set -e
+            sudo apt-get update -y
+            sudo apt-get install -y python3 python3-venv python3-pip tar
+            rm -rf ~/app && mkdir -p ~/app
+            tar -xzf ~/hello-ecr.tgz -C ~/app
+            cd ~/app
+            chmod +x run.sh
+            # stop previous if running
+            if [ -f app.pid ] && kill -0 \$(cat app.pid) 2>/dev/null; then kill \$(cat app.pid) || true; fi
+            export APP_PORT=\"${APP_PORT}\"
+            nohup bash ./run.sh > app.out 2>&1 & echo \$! > app.pid
+            echo \"PID \$(cat app.pid) started on port ${APP_PORT}\"
+          '"
+
+

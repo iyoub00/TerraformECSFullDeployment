@@ -8,15 +8,20 @@ set -euo pipefail
 : "${YOUR_IP_CIDR:=0.0.0.0/0}"
 : "${AWS_REGION:=eu-west-1}"
 
-# Resolve latest Amazon Linux 2023 x86_64 AMI (official owner 137112412989)
+# Resolve latest Ubuntu 22.04 Jammy (x86_64) AMI (official Canonical owner 099720109477)
 AMI_ID=$(aws ec2 describe-images \
   --region "$AWS_REGION" \
-  --owners 137112412989 \
-  --filters "Name=name,Values=al2023-ami-*-x86_64" "Name=state,Values=available" \
+  --owners 099720109477 \
+  --filters \
+    "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+    "Name=architecture,Values=x86_64" \
+    "Name=virtualization-type,Values=hvm" \
+    "Name=root-device-type,Values=ebs" \
+    "Name=state,Values=available" \
   --query "Images | sort_by(@, &CreationDate)[-1].ImageId" \
   --output text)
 
-echo "[cfn] Using AMI $AMI_ID"
+echo "[cfn] Using Ubuntu AMI $AMI_ID"
 
 aws cloudformation deploy \
   --region "$AWS_REGION" \

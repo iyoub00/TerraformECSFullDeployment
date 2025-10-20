@@ -149,4 +149,4 @@ sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}" --now
 sudo systemctl restart "${SERVICE_NAME}"
 
-log "Deployed on port ${APP_PORT} ✅"
+log "Deployed on port ${APP_PORT} "
