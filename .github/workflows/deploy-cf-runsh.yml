@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - hello-ecr/**
-      - .github/workflows/deploy-minimal-runsh.yml
+      - .github/workflows/deploy-cf-runsh.yml
   workflow_dispatch:
 
 concurrency:
