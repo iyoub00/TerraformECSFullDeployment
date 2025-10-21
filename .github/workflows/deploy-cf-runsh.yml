@@ -1,4 +1,4 @@
-name: EC2 deploy (minimal run.sh)
+name: EC2 deploy
 
 on:
   push:
