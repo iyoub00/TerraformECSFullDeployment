@@ -16,8 +16,8 @@ Parameters:
   YourIpCidr:
     Type: String
     Default: 0.0.0.0/0
-  AmiId:                           # <-- new
-    Type: AWS::EC2::Image::Id      # <-- plain AMI id
+  AmiId:
+    Type: AWS::EC2::Image::Id
 
 Resources:
   AppSG:
@@ -31,7 +31,7 @@ Resources:
   AppEC2:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: !Ref AmiId           # <-- changed
+      ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
       SecurityGroupIds: [ !Ref AppSG ]

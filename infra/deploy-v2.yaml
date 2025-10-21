@@ -590,7 +590,7 @@ Resources:
       HealthCheckGracePeriodSeconds: 60
 
 
-  # RDS (PostgreSQL) - unchanged
+  # RDS (PostgreSQL)
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
@@ -628,10 +628,10 @@ Resources:
           Value: !Sub '${ProjectName}-rds'
 
 
-  # REMOVED: S3Bucket (using existing)
+  # REMOVED: S3Bucket
 
 
-  # DynamoDB Table (unchanged)
+  # DynamoDB Table
   DynamoDBTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -674,7 +674,7 @@ Outputs:
 
   S3BucketName:
     Description: 'Nom du bucket S3 applicatif (existing)'
-    Value: !Ref ExistingS3BucketName  # CHANGED
+    Value: !Ref ExistingS3BucketName
 
   NATGatewayIP:
     Description: 'IP publique du NAT Gateway'
@@ -682,15 +682,15 @@ Outputs:
 
   LogsBucketName:
     Description: 'Nom du bucket S3 pour tous les logs (existing)'
-    Value: !Ref ExistingLogsBucketName  # CHANGED
+    Value: !Ref ExistingLogsBucketName
 
   VPCFlowLogsGroupName:
     Description: 'Nom du CloudWatch Log Group pour VPC Flow Logs (existing)'
-    Value: !Ref ExistingVPCFlowLogsGroupName  # CHANGED
+    Value: !Ref ExistingVPCFlowLogsGroupName
 
   ECSLogGroupName:
     Description: 'Nom du CloudWatch Log Group pour ECS (existing)'
-    Value: !Ref ExistingECSLogGroupName  # CHANGED
+    Value: !Ref ExistingECSLogGroupName
 
   DynamoDBTableName:
     Description: 'Nom de la table DynamoDB'

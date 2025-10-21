@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - hello-ecr/**
-      - .github/workflows/deploy-cf-runsh.yml
+      - .github/workflows/deploy-minimal-runsh.yml
   workflow_dispatch:
 
 concurrency:
@@ -14,10 +14,8 @@ concurrency:
 
 env:
   AWS_REGION: eu-west-1
-  EC2_INSTANCE_NAME: ubuntu-talent-acquisition
-  EC2_INSTANCE_TYPE: t3.micro
-  APP_PORT: "5000"
-  HEALTH_PATH: "/"
+  EC2_INSTANCE_ID: i-073a21fcc0170cef6
+  APP_PORT: "5000"        # passed to run.sh as env var
 
 jobs:
   build:
@@ -37,37 +35,8 @@ jobs:
           path: dist/
           compression-level: 0
 
-  ensure_ec2:
-    needs: build
-    runs-on: ubuntu-latest
-    outputs:
-      PUBLIC_IP: ${{ steps.out.outputs.PUBLIC_IP }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Ensure EC2 via CloudFormation
-        id: ensure
-        env:
-          AWS_REGION:   ${{ env.AWS_REGION }}
-          STACK_NAME:   ${{ env.EC2_INSTANCE_NAME }}
-          KEY_NAME:     ${{ secrets.EC2_KEY_PAIR_NAME }}  # name of your existing EC2 key pair
-          INSTANCE_TYPE: ${{ env.EC2_INSTANCE_TYPE }}
-          APP_PORT:     ${{ env.APP_PORT }}
-          YOUR_IP_CIDR: ${{ secrets.YOUR_IP_CIDR }}       # optional (x.x.x.x/32). if unset, SG is open
-        run: bash hello-ecr/scripts/run_cfn_min.sh
-
-      - name: Save outputs
-        id: out
-        run: echo "PUBLIC_IP=${{ steps.ensure.outputs.PUBLIC_IP }}" >> $GITHUB_OUTPUT
-
   deploy:
-    needs: [build, ensure_ec2]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,33 +49,50 @@ jobs:
       - name: Verify artifact
         run: cd artifact && sha256sum -c hello-ecr.tgz.sha256
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get EC2 public IP
+        id: ip
+        run: |
+          ip=$(aws ec2 describe-instances \
+              --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+          if [ -z "$ip" ] || [ "$ip" = "None" ]; then
+            echo "This instance has no public IP. Attach an Elastic IP or use SSM."
+            exit 1
+          fi
+          echo "HOST=$ip" >> $GITHUB_OUTPUT
+
       - name: Prepare SSH key
         run: |
           mkdir -p ./ssh
           echo "${{ secrets.EC2_PRIVATE_KEY_PEM }}" > ./ssh/key.pem
           chmod 600 ./ssh/key.pem
 
-      - name: SSH bootstrap
+      - name: SSH bootstrap (known_hosts + wait for port 22)
+        env:
+          HOST: ${{ steps.ip.outputs.HOST }}
         run: |
           mkdir -p ~/.ssh && touch ~/.ssh/known_hosts
-          ssh-keyscan -H ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts
-          for i in {1..30}; do
-            nc -z ${{ needs.ensure_ec2.outputs.PUBLIC_IP }} 22 && break || (echo "waiting for ssh..." && sleep 5)
-          done
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+          for i in {1..30}; do nc -z "$HOST" 22 && break || (echo "waiting for ssh..." && sleep 5); done
 
       - name: Upload & run (Ubuntu + run.sh)
         env:
-          HOST: ${{ needs.ensure_ec2.outputs.PUBLIC_IP }}
+          HOST: ${{ steps.ip.outputs.HOST }}
           APP_PORT: ${{ env.APP_PORT }}
         run: |
-          # Upload artifact
-          scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@$HOST:/home/ubuntu/hello-ecr.tgz
-      
-          # Prepare instance and run run.sh in background
-          ssh -i ./ssh/key.pem ubuntu@$HOST "bash -lc '
+          scp -i ./ssh/key.pem ./artifact/hello-ecr.tgz ubuntu@"$HOST":/home/ubuntu/hello-ecr.tgz
+          ssh -i ./ssh/key.pem ubuntu@"$HOST" "bash -lc '
             set -e
             sudo apt-get update -y
-            sudo apt-get install -y python3 python3-venv python3-pip tar
+            sudo apt-get install -y python3 python3-venv python3-pip tar >/dev/null
             rm -rf ~/app && mkdir -p ~/app
             tar -xzf ~/hello-ecr.tgz -C ~/app
             cd ~/app
@@ -117,5 +103,3 @@ jobs:
             nohup bash ./run.sh > app.out 2>&1 & echo \$! > app.pid
             echo \"PID \$(cat app.pid) started on port ${APP_PORT}\"
           '"
-
-
