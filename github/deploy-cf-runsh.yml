@@ -5,7 +5,7 @@ on:
     branches: [main, master]
     paths:
       - hello-ecr/**
-      - .github/workflows/deploy-cf-runsh.yml
+      - deploy-cf-runsh.yml
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ concurrency:
 env:
   AWS_REGION: eu-west-1
   EC2_INSTANCE_ID: i-073a21fcc0170cef6
-  APP_PORT: "5000"        # passed to run.sh as env var
+  APP_PORT: "5000"
 
 jobs:
   build:
